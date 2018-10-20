@@ -8,12 +8,15 @@ using ServiceStack.Redis;
 
 namespace RedisBank
 {
+    
     public class User
     {
+        public IRedisClient redisClient { get; set; }
         public string first_name { get; set; }
         public string last_name { get; set; }
         public string ID;
-        
+        public string Nationality;
+
         static byte[] GetStringBytes(string str)
         {
             return Encoding.UTF8.GetBytes(str);
@@ -21,26 +24,52 @@ namespace RedisBank
 
         public void pushUsrToRedis(IRedisNativeClient redis)
         {
-            byte[][] keysArr = { GetStringBytes("First_Name"), GetStringBytes("Last_Name") };
-            byte[][] valueArr = { GetStringBytes(first_name), GetStringBytes(last_name) };
-            redis.HMSet($"person:{ID}", keysArr, valueArr);
+            int response = Transaction(redis);
+            while (response == 0) response = Transaction(redis);
+        }
+
+        public int Transaction(IRedisNativeClient redis)
+        {
+            Random rnd = new Random();
+            while (redis.Exists($"person:{ID}") == 1) ID = Nationality + rnd.Next(99999).ToString();
+            string[] watchkeys = { $"person:{ID}", "First_Name", "Last_Name" };
+            redisClient.Watch(watchkeys);
+            using (IRedisTransaction trans = redisClient.CreateTransaction())
+            {
+                trans.QueueCommand(redisClient => redisClient.SetEntryInHash($"person:{ID}", "First_Name", first_name));
+                trans.QueueCommand(redisClient => redisClient.SetEntryInHash($"person:{ID}", "Last_Name", last_name));
+                return trans.Commit() == false ? 0 : 1;
+            }
         }
     }
 
     public class Account
     {
+        public IRedisClient redisClient { get; set; }
         public string ID { get; set; }
         public string holder { get; set; }
         public string balance { get; set; }
 
         public void pushAccToRedis(IRedisNativeClient redis)
         {
-            redis.HSet($"account:{ID}", GetStringBytes("Balance"), GetStringBytes(balance));
-            redis.Set($"account:{ID}:holder", GetStringBytes(holder));
-            redis.RPush($"{holder}_accounts", GetStringBytes(ID));
+            int response = Transaction(redis);
+            while (response == 0) response = Transaction(redis);
         }
 
-        //redis.SetEntryInHash($"account:{ID}", "Balance", balance);
+        public int Transaction(IRedisNativeClient redis)
+        {
+            Random rnd = new Random();
+            while (redis.Exists($"account:{ID}:holder") == 1) ID = rnd.Next(99999).ToString(); 
+            //How to update watch in MULTI down below
+            redisClient.Watch("account:{ ID}:holder");
+            using (IRedisTransaction trans = redisClient.CreateTransaction())
+            {
+                trans.QueueCommand(redisClient => redisClient.SetEntryInHash($"account:{ID}", "Balance", balance));
+                trans.QueueCommand(redisClient => redisClient.Set($"account:{ID}:holder", GetStringBytes(holder)));
+                trans.QueueCommand(redisClient => redisClient.AddItemToList($"{holder}_accounts", ID));
+                return trans.Commit() == false ? 0 : 1;
+            }
+        }
 
 
         static byte[] GetStringBytes(string str)

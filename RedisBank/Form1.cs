@@ -16,7 +16,7 @@ namespace RedisBank
     public partial class Form1 : Form
     {
         IRedisNativeClient redis = new RedisClient("localhost", 6379);
-        IRedisClient redisClient = new RedisClient("localhost", 6379);
+        RedisClient redisClient = new RedisClient("localhost", 6379);
 
         public Form1()
         {
@@ -44,12 +44,13 @@ namespace RedisBank
                 !string.IsNullOrEmpty(comboBox1.Text))
             {
                 string ID = comboBox1.SelectedItem + rnd.Next(99999).ToString();
-                while (redis.Exists($"person:{ID}") == 1) ID = rnd.Next(99999).ToString();
                 User user = new User
                 {
+                    redisClient = redisClient,
                     first_name = textBox1.Text,
                     last_name = textBox2.Text,
-                    ID = ID
+                    ID = ID,
+                    Nationality = comboBox1.SelectedItem.ToString()
                 };
                 user.pushUsrToRedis(redis);
                 UserSession.Login(user);
@@ -69,23 +70,26 @@ namespace RedisBank
         {
             Random rnd = new Random();
             string ID = rnd.Next(99999).ToString();
-
-            while (redis.Exists($"account:{ID}") == 1) ID = rnd.Next(99999).ToString();
-
             Account acc = new Account
             {
+                redisClient = redisClient,
                 ID = ID,
                 holder = UserSession.GetUser().ID,
                 balance = "0"
             };
             acc.pushAccToRedis(redis);
-            string[] row = { ID, Encoding.UTF8.GetString(redis.HGet($"account:{ID}", Encoding.UTF8.GetBytes("Balance"))) };
+            string[] row = { acc.ID, Encoding.UTF8.GetString(redis.HGet($"account:{acc.ID}", Encoding.UTF8.GetBytes("Balance"))) };
             var listViewItem = new ListViewItem(row);
             listView1.Items.Add(listViewItem);
         }
 
         //Show active users accounts
         private void button2_Click_1(object sender, EventArgs e)
+        {
+            ShowAccounts();
+        }
+
+        public void ShowAccounts()
         {
             string usrID = UserSession.GetUser().ID;
             listView1.Items.Clear();
@@ -107,16 +111,18 @@ namespace RedisBank
                !string.IsNullOrWhiteSpace(textBox4.Text))
             {
                 string accID = AddMBox.Text;
-                
+                if(redis.Get($"account:{accID}:holder") != null)
                 {
-                    /*BitConverter.ToInt64(edis.HGet($"account:{AddMBox.Text}",
-                        Encoding.UTF8.GetBytes("Balance")),0);
-                    System.ArgumentException: 'Destination array is not long enough to copy all the items in the collection. Check array index and length.'
-                    */
+                    if (Encoding.UTF8.GetString(redis.Get($"account:{accID}:holder")) == UserSession.GetUser().ID)
+                    {
+                        label11.Text = UserSession.GetUser().ID;
+                        SetBalanceInfo(accID);
+                        ShowAccounts();
+                        textBox3.Text = AddMBox.Text;
+                    }
+                    else label11.Text = AddMBox.Text + "Is not your account";
                 }
-                Double balance = GetBalanceInfo(accID);
-                balance += textBox4.Text.ToDouble();
-                SetBalanceInfo(accID, balance);
+                else label11.Text = "Account doesn't exist";
             }
         }
 
@@ -127,15 +133,27 @@ namespace RedisBank
                !string.IsNullOrWhiteSpace(textBox5.Text) &&
                !string.IsNullOrWhiteSpace(textBox6.Text))
             {
-                label11.Text = "Processing";
-                int response = Transaction();
-                while (response == 0) response = Transaction();
+                if (redis.Get($"account:{textBox3.Text}:holder") != null && redis.Get($"account:{textBox5.Text}:holder") != null)
+                {
+                    if (Encoding.UTF8.GetString(redis.Get($"account:{textBox3.Text}:holder")) == UserSession.GetUser().ID)
+                    {
+                        label11.Text = "Processing";
+                        int response = Transaction();
+                        while (response == 0) response = Transaction();
 
-                if (response == 1) label11.Text = "Success";
-                if (response == -1) label11.Text = "Not enough money in the account";
+                        if (response == 1)
+                        {
+                            ShowAccounts();
+                            label11.Text = "Success";
+                        }
+                        if (response == -1) label11.Text = "Not enough money in the account";
+                    }
+                    else label11.Text = "The account youre sending money from is not yours";
+                }
+                else label11.Text = "One of the chosen accounts is not existant";
             }
+            else label11.Text = "Put all the required information";
             
-
         }
 
         public int Transaction()
@@ -156,16 +174,14 @@ namespace RedisBank
 
                     if (balanceFrom >= ammount)
                     {
-                        //SetBalanceInfo(fromAccID, balanceFrom -= ammount, trans);
-                        //SetBalanceInfo(toAccID, balanceTo += ammount, trans);
                         balanceFrom -= ammount;
                         balanceTo += ammount;
                         trans.QueueCommand(redisClient => redisClient.SetEntryInHash($"account:{fromAccID}", "Balance", balanceFrom.ToString()));
                         trans.QueueCommand(redisClient => redisClient.SetEntryInHash($"account:{toAccID}", "Balance", balanceTo.ToString()));
-                        return trans.Commit() == false ? 0 : 1;
+                        return trans.Commit() == false ? 0 : 1; //TODO: limit cycles
                     }
                     else return -1;
-            }
+                }
             
         }
 
@@ -188,20 +204,21 @@ namespace RedisBank
                 return balance;
         }
 
-        private void SetBalanceInfo(string accID, Double balance)
+        private void SetBalanceInfo(string accID)
         {
-            redis.HSet($"account:{accID}",
-                    Encoding.UTF8.GetBytes("Balance"),
-                    Encoding.UTF8.GetBytes(balance.ToString()));
-        }
-
-        private void SetBalanceInfo(string accID, Double balance, IRedisTransaction trans)
-        {
-            using (trans)
+            redisClient.Watch($"account:{accID}", "Balance");
+            using (IRedisTransaction trans = redisClient.CreateTransaction())
             {
+                Double balance = GetBalanceInfo(accID);
+                balance += textBox4.Text.ToDouble();
                 trans.QueueCommand(redisClient => redisClient.SetEntryInHash($"account:{accID}", "Balance", balance.ToString()));
+                if (trans.Commit() == true)
+                {
+                    label11.Text = "Success";
+                }
+                else label11.Text = "Check your account number and try again";
             }
-            
+                
         }
 
         //Money to add to account TextBox KeyPress check (only numbers and one comma allowed)
@@ -331,6 +348,11 @@ namespace RedisBank
         }
 
         private void label11_Click(object sender, EventArgs e)
+        {
+
+        }
+
+        private void textBox3_TextChanged_1(object sender, EventArgs e)
         {
 
         }
